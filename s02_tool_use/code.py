@@ -3,7 +3,7 @@
 s02: Tool Use — 在 s01 基础上新增 4 个工具 + 分发映射。
 
 运行: python s02_tool_use/code.py
-需要: pip install anthropic python-dotenv + .env 中配置 ANTHROPIC_API_KEY
+需要: pip install openai python-dotenv + .env 中配置 OPENAI_API_KEY
 
 本文件 = s01 的全部代码 + 以下新增:
   + run_read / run_write / run_edit / run_glob 四个工具实现
@@ -13,7 +13,9 @@ s02: Tool Use — 在 s01 基础上新增 4 个工具 + 分发映射。
 循环本身（agent_loop）与 s01 完全一致。
 """
 
-import os, subprocess
+import json
+import os
+import subprocess
 from pathlib import Path
 
 try:
@@ -25,16 +27,17 @@ try:
 except ImportError:
     pass
 
-from anthropic import Anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
+client = OpenAI(
+    api_key=os.environ["OPENAI_API_KEY"],
+    base_url=os.getenv("OPENAI_BASE_URL"),
+)
+MODEL = os.environ["OPENAI_MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain."
 
@@ -119,16 +122,76 @@ def run_glob(pattern: str) -> str:
 # ═══════════════════════════════════════════════════════════
 
 TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to a file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in a file once.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-    {"name": "glob", "description": "Find files matching a glob pattern.",
-     "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Run a shell command.",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read file contents.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write content to a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Replace exact text in a file once.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string"},
+                },
+                "required": ["path", "old_text", "new_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "glob",
+            "description": "Find files matching a glob pattern.",
+            "parameters": {
+                "type": "object",
+                "properties": {"pattern": {"type": "string"}},
+                "required": ["pattern"],
+            },
+        },
+    },
 ]
 
 # ═══════════════════════════════════════════════════════════
@@ -143,31 +206,67 @@ TOOL_HANDLERS = {
 
 # ═══════════════════════════════════════════════════════════
 #  agent_loop — 与 s01 结构完全一致，只改了工具执行那部分
-#  s01: output = run_bash(block.input["command"])
-#  s02: output = TOOL_HANDLERS[block.name](**block.input)
+#  s01: output = run_bash(arguments["command"])
+#  s02: output = TOOL_HANDLERS[tool_name](**arguments)
 # ═══════════════════════════════════════════════════════════
+
+def tool_call_to_dict(tool_call) -> dict:
+    return {
+        "id": tool_call.id,
+        "type": getattr(tool_call, "type", "function"),
+        "function": {
+            "name": tool_call.function.name,
+            "arguments": tool_call.function.arguments,
+        },
+    }
+
 
 def agent_loop(messages: list):
     while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "system", "content": SYSTEM}, *messages],
+            tools=TOOLS,
+            tool_choice="auto",
+            max_completion_tokens=8000,
         )
-        messages.append({"role": "assistant", "content": response.content})
+        message = response.choices[0].message
 
-        if response.stop_reason != "tool_use":
+        assistant_message = {
+            "role": "assistant",
+            "content": message.content,
+        }
+        if message.tool_calls:
+            assistant_message["tool_calls"] = [
+                tool_call_to_dict(tool_call) for tool_call in message.tool_calls
+            ]
+        messages.append(assistant_message)
+
+        if not message.tool_calls:
             return
 
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                print(f"\033[33m> {block.name}\033[0m")
-                handler = TOOL_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown: {block.name}"
-                print(str(output)[:200])
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
-
-        messages.append({"role": "user", "content": results})
+        for tool_call in message.tool_calls:
+            tool_name = tool_call.function.name
+            print(f"\033[33m> {tool_name}\033[0m")
+            handler = TOOL_HANDLERS.get(tool_name)
+            if not handler:
+                output = f"Error: Unknown tool {tool_name}"
+            else:
+                try:
+                    # 将模型返回的 tool_call.function.arguments 转换为字典
+                    arguments = json.loads(tool_call.function.arguments or "{}")
+                    # ** 将字典展开为关键字参数，比如 run_read(path="README.md", limit=3)
+                    output = handler(**arguments)
+                except json.JSONDecodeError as e:
+                    output = f"Error: Invalid {tool_name} arguments: {e}"
+                except TypeError as e:
+                    output = f"Error: Invalid {tool_name} arguments: {e}"
+            print(str(output)[:200])
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": output,
+            })
 
 
 if __name__ == "__main__":
@@ -184,7 +283,7 @@ if __name__ == "__main__":
             break
         history.append({"role": "user", "content": query})
         agent_loop(history)
-        for block in history[-1]["content"]:
-            if getattr(block, "type", None) == "text":
-                print(block.text)
+        response_content = history[-1].get("content")
+        if response_content:
+            print(response_content)
         print()

@@ -25,10 +25,13 @@ Changes from s04:
   Loop unchanged: new tool auto-dispatches via TOOL_HANDLERS.
 
 Run: python s05_todo_write/code.py
-Needs: pip install anthropic python-dotenv + ANTHROPIC_API_KEY in .env
+Needs: pip install openai python-dotenv + OPENAI_API_KEY in .env
 """
 
-import os, subprocess
+import json
+import os
+import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 try:
@@ -37,16 +40,17 @@ try:
 except ImportError:
     pass
 
-from anthropic import Anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
+client = OpenAI(
+    api_key=os.environ["OPENAI_API_KEY"],
+    base_url=os.getenv("OPENAI_BASE_URL"),
+)
+MODEL = os.environ["OPENAI_MODEL_ID"]
 CURRENT_TODOS: list[dict] = []
 
 # s05 change: SYSTEM prompt adds planning guidance
@@ -55,6 +59,13 @@ SYSTEM = (
     "Before starting any multi-step task, use todo_write to plan your steps. "
     "Update status as you go."
 )
+
+
+@dataclass
+class ToolBlock:
+    id: str
+    name: str
+    input: dict
 
 
 # ═══════════════════════════════════════════════════════════
@@ -138,19 +149,104 @@ def run_todo_write(todos: list) -> str:
     return f"Updated {len(CURRENT_TODOS)} tasks"
 
 TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to a file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in a file once.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-    {"name": "glob", "description": "Find files matching a glob pattern.",
-     "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Run a shell command.",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read file contents.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write content to a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Replace exact text in a file once.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string"},
+                },
+                "required": ["path", "old_text", "new_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "glob",
+            "description": "Find files matching a glob pattern.",
+            "parameters": {
+                "type": "object",
+                "properties": {"pattern": {"type": "string"}},
+                "required": ["pattern"],
+            },
+        },
+    },
     # s05: new tool
-    {"name": "todo_write", "description": "Create and manage a task list for your current coding session.",
-     "input_schema": {"type": "object", "properties": {"todos": {"type": "array", "items": {"type": "object", "properties": {"content": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["content", "status"]}}}, "required": ["todos"]}},
+    {
+        "type": "function",
+        "function": {
+            "name": "todo_write",
+            "description": "Create and manage a task list for your current coding session.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string"},
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"],
+                                },
+                            },
+                            "required": ["content", "status"],
+                        },
+                    },
+                },
+                "required": ["todos"],
+            },
+        },
+    },
 ]
 
 TOOL_HANDLERS = {
@@ -199,9 +295,7 @@ def context_inject_hook(query: str):
 
 def summary_hook(messages: list):
     """Stop: print tool call count."""
-    tool_count = sum(1 for m in messages
-                     for b in (m.get("content") if isinstance(m.get("content"), list) else [])
-                     if isinstance(b, dict) and b.get("type") == "tool_result")
+    tool_count = sum(1 for m in messages if m.get("role") == "tool")
     print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
     return None
 
@@ -217,6 +311,16 @@ register_hook("Stop", summary_hook)
 
 rounds_since_todo = 0
 
+def tool_call_to_dict(tool_call) -> dict:
+    return {
+        "id": tool_call.id,
+        "type": getattr(tool_call, "type", "function"),
+        "function": {
+            "name": tool_call.function.name,
+            "arguments": tool_call.function.arguments,
+        },
+    }
+
 def agent_loop(messages: list):
     global rounds_since_todo
     while True:
@@ -226,13 +330,26 @@ def agent_loop(messages: list):
                              "content": "<reminder>Update your todos.</reminder>"})
             rounds_since_todo = 0
 
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "system", "content": SYSTEM}, *messages],
+            tools=TOOLS,
+            tool_choice="auto",
+            max_completion_tokens=8000,
         )
-        messages.append({"role": "assistant", "content": response.content})
+        message = response.choices[0].message
 
-        if response.stop_reason != "tool_use":
+        assistant_message = {
+            "role": "assistant",
+            "content": message.content,
+        }
+        if message.tool_calls:
+            assistant_message["tool_calls"] = [
+                tool_call_to_dict(tool_call) for tool_call in message.tool_calls
+            ]
+        messages.append(assistant_message)
+
+        if not message.tool_calls:
             force = trigger_hooks("Stop", messages)
             if force:
                 messages.append({"role": "user", "content": force})
@@ -240,30 +357,37 @@ def agent_loop(messages: list):
             return
 
         rounds_since_todo += 1
-        results = []
-        for block in response.content:
-            if block.type != "tool_use":
-                continue
+        for tool_call in message.tool_calls:
+            tool_name = tool_call.function.name
 
-            blocked = trigger_hooks("PreToolUse", block)
-            if blocked:
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": str(blocked)})
-                continue
+            try:
+                arguments = json.loads(tool_call.function.arguments or "{}")
+            except json.JSONDecodeError as e:
+                output = f"Error: Invalid {tool_name} arguments: {e}"
+            else:
+                block = ToolBlock(id=tool_call.id, name=tool_name, input=arguments)
 
-            handler = TOOL_HANDLERS.get(block.name)
-            output = handler(**block.input) if handler else f"Unknown: {block.name}"
+                blocked = trigger_hooks("PreToolUse", block)
+                if blocked:
+                    output = str(blocked)
+                else:
+                    handler = TOOL_HANDLERS.get(block.name)
+                    try:
+                        output = handler(**block.input) if handler else f"Unknown: {block.name}"
+                    except TypeError as e:
+                        output = f"Error: Invalid {block.name} arguments: {e}"
 
-            trigger_hooks("PostToolUse", block, output)
+                    trigger_hooks("PostToolUse", block, output)
 
-            # s05: reset nag counter when todo_write is called
-            if block.name == "todo_write":
-                rounds_since_todo = 0
+                    # s05: reset nag counter when todo_write is called
+                    if block.name == "todo_write":
+                        rounds_since_todo = 0
 
-            results.append({"type": "tool_result", "tool_use_id": block.id,
-                            "content": output})
-
-        messages.append({"role": "user", "content": results})
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": output,
+            })
 
 
 if __name__ == "__main__":
@@ -281,7 +405,7 @@ if __name__ == "__main__":
         trigger_hooks("UserPromptSubmit", query)
         history.append({"role": "user", "content": query})
         agent_loop(history)
-        for block in history[-1]["content"]:
-            if getattr(block, "type", None) == "text":
-                print(block.text)
+        response_content = history[-1].get("content")
+        if response_content:
+            print(response_content)
         print()

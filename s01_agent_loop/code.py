@@ -99,6 +99,8 @@ def tool_call_to_dict(tool_call) -> dict:
 # ── The core pattern: a while loop that calls tools until the model stops ──
 def agent_loop(messages: list):
     while True:
+        # chat.completions.create 不是“创建一个 Agent”，而是向模型发起一次请求。
+        # messages 是到目前为止的对话历史；模型只能根据这里的上下文决定下一步。
         response = client.chat.completions.create(
             model=MODEL,
             messages=[{"role": "system", "content": SYSTEM}, *messages],
@@ -106,24 +108,28 @@ def agent_loop(messages: list):
             tool_choice="auto",
             max_completion_tokens=8000,
         )
+        # Chat Completions 的返回里可能有多个候选，这里只取第一个模型回复。
+        # message 是本轮 assistant 的输出，可能是普通文本，也可能带 tool_calls。
         message = response.choices[0].message
 
-        # Append assistant turn
+        # 把 assistant 本轮回复写回历史；下一轮请求会把它一起发给模型。
         assistant_message = {
             "role": "assistant",
             "content": message.content,
         }
         if message.tool_calls:
+            # 如果模型决定调用工具，要把 tool_calls 原样保存在 assistant 消息里。
+            # 后面的 tool 结果会用 tool_call_id 对应回这里的调用。
             assistant_message["tool_calls"] = [
                 tool_call_to_dict(tool_call) for tool_call in message.tool_calls
             ]
         messages.append(assistant_message)
 
-        # If the model didn't call a tool, we're done
+        # 没有 tool_calls 说明模型不需要继续执行命令，本次 agent loop 结束。
         if not message.tool_calls:
             return
 
-        # Execute each tool call, collect results
+        # 执行模型提出的每个工具调用。这里唯一允许的工具是 bash。
         for tool_call in message.tool_calls:
             if tool_call.function.name != "bash":
                 output = f"Error: Unknown tool {tool_call.function.name}"
@@ -138,7 +144,7 @@ def agent_loop(messages: list):
                     output = run_bash(command)
                     print(output[:200])
 
-            # Feed tool results back, loop continues
+            # 把工具结果作为 role="tool" 的消息喂回模型；下一轮 create 会看到结果。
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call.id,

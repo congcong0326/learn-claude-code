@@ -18,16 +18,18 @@ Three gates inserted before tool execution:
 
 Only one line added to the agent loop:
 
-    if not check_permission(block):
+    if not check_permission(tool_name, arguments):
         continue
 
 Builds on s02 (multi-tool). Usage:
 
     python s03_permission/code.py
-    Needs: pip install anthropic python-dotenv + ANTHROPIC_API_KEY in .env
+    Needs: pip install openai python-dotenv + OPENAI_API_KEY in .env
 """
 
-import os, subprocess
+import json
+import os
+import subprocess
 from pathlib import Path
 
 try:
@@ -39,16 +41,17 @@ try:
 except ImportError:
     pass
 
-from anthropic import Anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
+client = OpenAI(
+    api_key=os.environ["OPENAI_API_KEY"],
+    base_url=os.getenv("OPENAI_BASE_URL"),
+)
+MODEL = os.environ["OPENAI_MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. All destructive operations require user approval."
 
@@ -123,16 +126,76 @@ def run_glob(pattern: str) -> str:
 # ═══════════════════════════════════════════════════════════
 
 TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to a file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in a file once.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-    {"name": "glob", "description": "Find files matching a glob pattern.",
-     "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Run a shell command.",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read file contents.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write content to a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Replace exact text in a file once.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string"},
+                },
+                "required": ["path", "old_text", "new_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "glob",
+            "description": "Find files matching a glob pattern.",
+            "parameters": {
+                "type": "object",
+                "properties": {"pattern": {"type": "string"}},
+                "required": ["pattern"],
+            },
+        },
+    },
 ]
 
 TOOL_HANDLERS = {
@@ -181,54 +244,81 @@ def ask_user(tool_name: str, args: dict, reason: str) -> str:
 
 
 # Pipeline: all three gates chained
-def check_permission(block) -> bool:
-    if block.name == "bash":
-        reason = check_deny_list(block.input.get("command", ""))
+def check_permission(tool_name: str, args: dict) -> bool:
+    if tool_name == "bash":
+        reason = check_deny_list(args.get("command", ""))
         if reason:
             print(f"\n\033[31m⛔ {reason}\033[0m")
             return False
-    reason = check_rules(block.name, block.input)
+    reason = check_rules(tool_name, args)
     if reason:
-        decision = ask_user(block.name, block.input, reason)
+        decision = ask_user(tool_name, args, reason)
         if decision == "deny":
             return False
     return True
 
 
 # ═══════════════════════════════════════════════════════════
-#  agent_loop — same as s02, with check_permission() inserted
+#  agent_loop — OpenAI version of s02, with check_permission() inserted
 # ═══════════════════════════════════════════════════════════
+
+def tool_call_to_dict(tool_call) -> dict:
+    return {
+        "id": tool_call.id,
+        "type": getattr(tool_call, "type", "function"),
+        "function": {
+            "name": tool_call.function.name,
+            "arguments": tool_call.function.arguments,
+        },
+    }
+
 
 def agent_loop(messages: list):
     while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "system", "content": SYSTEM}, *messages],
+            tools=TOOLS,
+            tool_choice="auto",
+            max_completion_tokens=8000,
         )
-        messages.append({"role": "assistant", "content": response.content})
+        message = response.choices[0].message
 
-        if response.stop_reason != "tool_use":
+        assistant_message = {
+            "role": "assistant",
+            "content": message.content,
+        }
+        if message.tool_calls:
+            assistant_message["tool_calls"] = [
+                tool_call_to_dict(tool_call) for tool_call in message.tool_calls
+            ]
+        messages.append(assistant_message)
+
+        if not message.tool_calls:
             return
 
-        results = []
-        for block in response.content:
-            if block.type != "tool_use":
-                continue
+        for tool_call in message.tool_calls:
+            tool_name = tool_call.function.name
+            print(f"\033[36m> {tool_name}\033[0m")
 
-            print(f"\033[36m> {block.name}\033[0m")
+            try:
+                arguments = json.loads(tool_call.function.arguments or "{}")
+            except json.JSONDecodeError as e:
+                output = f"Error: Invalid {tool_name} arguments: {e}"
+            else:
+                # s03 change: run through permission pipeline before executing
+                if not check_permission(tool_name, arguments):
+                    output = "Permission denied."
+                else:
+                    handler = TOOL_HANDLERS.get(tool_name)
+                    output = handler(**arguments) if handler else f"Unknown: {tool_name}"
 
-            # s03 change: run through permission pipeline before executing
-            if not check_permission(block):
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": "Permission denied."})
-                continue
-
-            handler = TOOL_HANDLERS.get(block.name)
-            output = handler(**block.input) if handler else f"Unknown: {block.name}"
             print(str(output)[:200])
-            results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
-
-        messages.append({"role": "user", "content": results})
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": output,
+            })
 
 
 if __name__ == "__main__":
@@ -245,7 +335,7 @@ if __name__ == "__main__":
             break
         history.append({"role": "user", "content": query})
         agent_loop(history)
-        for block in history[-1]["content"]:
-            if getattr(block, "type", None) == "text":
-                print(block.text)
+        response_content = history[-1].get("content")
+        if response_content:
+            print(response_content)
         print()
